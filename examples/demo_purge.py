@@ -8,7 +8,10 @@
 4) 未开封资料清除时：进行中开封请求失效、旧同意作废、待确认交接邀请失效；
 5) 清除与最早开封同刻时清除优先；开封更早则先开封再清除；
 6) 已清除资料不能再开封/替换见证人/交接/再安排清除；到期的改期与取消被拒；
-7) 交接后由新封存人管理清除安排，原封存人无权操作。
+7) 交接后由新封存人管理清除安排，原封存人无权操作；
+8) 时间边界：改期/取消等待数据库写锁期间旧清除时刻已到的，取锁后先按既有
+   顺序结算到点开封与清除（同刻清除优先、连带失效落库），再沿用 409 拒绝；
+   新提交时刻取锁后已非未来的沿用 400 且不改变原计划。
 
 用法: python examples/demo_purge.py [base_url]
 """
@@ -225,6 +228,90 @@ def main() -> None:
     assert call("PUT", f"/documents/{doc6}/purge", erin, {"purge_at": in_hours(2)})[0] == 200
     assert call("DELETE", f"/documents/{doc6}/purge", erin)[0] == 200
     print("-- 原封存人 403；新封存人改期/取消成功 -> 通过")
+
+    # ------------------------------------------------------------------
+    # 场景 6：等待写锁期间越过旧清除时刻 -> 先清除落库，再 409 拒绝改期/取消
+    #
+    # 用另一个连接占用数据库写锁（生产上即并发写事务），期间发起的改期/取消
+    # 阻塞在 BEGIN IMMEDIATE；取锁后必须以实际时刻判定，而不是请求到达时刻。
+    # ------------------------------------------------------------------
+    print("== 场景 6：等锁越过旧清除时刻的时间边界（先结算、再 409）==")
+    import os
+    import sqlite3
+    import threading
+
+    _, sealed = call("POST", "/documents", alice,
+                     {"body": "清除示例正文 7：LOCK-RACE-SECRET",
+                      "witnesses": ["p-bob", "p-carol", "p-dave"]})
+    doc7, digest7 = sealed["document_id"], sealed["digest"]
+    _, resp = call("PUT", f"/documents/{doc7}/purge", alice, {"purge_at": in_seconds(2)})
+    old_purge = resp["purge_at"]
+    # 一个进行中开封请求（1 票）与一份待确认交接邀请：清除时须连带失效
+    _, req = call("POST", f"/documents/{doc7}/open-requests", alice,
+                  {"reason": "清除前申请", "deadline": in_hours(2)})
+    req7 = req["request_id"]
+    call("POST", f"/open-requests/{req7}/approve", bob, {"digest": digest7})
+    _, inv = call("POST", f"/documents/{doc7}/handover-invitations", alice,
+                  {"to_username": "p-erin", "confirm_deadline": in_hours(1)})
+    inv7 = inv["invitation_id"]
+
+    outcomes = {}
+
+    def blocking_put():
+        outcomes["put"] = call("PUT", f"/documents/{doc7}/purge", alice,
+                               {"purge_at": in_hours(24)})
+
+    db_path = os.environ.get("SEAL_DB_PATH", "/data/seal.db")
+    lock_conn = sqlite3.connect(db_path, timeout=30)
+    lock_conn.execute("BEGIN IMMEDIATE")
+    t = threading.Thread(target=blocking_put)
+    t.start()
+    time.sleep(3)          # 持锁期间，改期排队等待并越过 2 秒后的旧清除时刻
+    lock_conn.rollback()
+    lock_conn.close()
+    t.join(15)
+
+    status, resp = outcomes["put"]
+    show("等锁越过旧清除时刻后的改期", status, resp)
+    assert status == 409, resp
+    # 清除已先生效：正文清空、purge_at 仍是旧时刻（没有被改到 24 小时后）
+    _, got = call("GET", f"/documents/{doc7}", alice)
+    assert got["status"] == "purged" and got["purged_at"] == old_purge
+    assert "body" not in got
+    assert got["open_request"]["status"] == "invalidated"
+    _, inv_view = call("GET", f"/handover-invitations/{inv7}", alice)
+    assert inv_view["status"] == "expired"
+    # 取消同样 409
+    assert call("DELETE", f"/documents/{doc7}/purge", alice)[0] == 409
+    print("-- 改期未覆盖已到期清除；请求失效、邀请逾期、清除先落库 -> 通过")
+
+    # 旧计划未到、但新提交时刻在等锁期间变为非未来 -> 400 且原计划不变
+    _, sealed = call("POST", "/documents", alice,
+                     {"body": "清除示例正文 8：LOCK-RACE-400",
+                      "witnesses": ["p-bob", "p-carol", "p-dave"]})
+    doc8 = sealed["document_id"]
+    _, resp = call("PUT", f"/documents/{doc8}/purge", alice, {"purge_at": in_hours(5)})
+    planned = resp["purge_at"]
+
+    def blocking_put_past():
+        outcomes["put400"] = call("PUT", f"/documents/{doc8}/purge", alice,
+                                  {"purge_at": in_seconds(2)})
+
+    lock_conn = sqlite3.connect(db_path, timeout=30)
+    lock_conn.execute("BEGIN IMMEDIATE")
+    t = threading.Thread(target=blocking_put_past)
+    t.start()
+    time.sleep(3)          # 新提交的 2 秒时刻在等待期间流逝，旧计划（5 小时）未到
+    lock_conn.rollback()
+    lock_conn.close()
+    t.join(15)
+
+    status, resp = outcomes["put400"]
+    show("等锁后新时刻已非未来", status, resp)
+    assert status == 400 and resp == {"detail": "清除时刻必须晚于当前时间"}
+    _, got = call("GET", f"/documents/{doc8}", alice)
+    assert got["status"] == "sealed" and got["purge_at"] == planned   # 原计划不变
+    print("-- 新时刻取锁后已非未来：400 拒绝且不改变原计划 -> 通过")
 
     print("\n全部到期清除示例断言通过。资料 1 的审计动作：")
     _, audit = call("GET", f"/documents/{doc1}/audit", alice)

@@ -44,6 +44,13 @@
   待确认交接邀请失效；清除与最早开封同刻时清除优先，开封更早则先开封；
   已清除资料不能再开封、替换见证人、交接或再安排清除；已到期的改期或取消
   一律拒绝且不泄露正文；
+- 改期（PUT）与取消（DELETE）的时间判定一律以取得写锁后的实际时刻为准：
+  请求在旧清除时刻（及新提交的 purge_at）之前到达、等待 BEGIN IMMEDIATE
+  写锁期间越过任一时刻的，取锁后先按现有顺序结算到点开封与到期清除（同刻
+  清除优先：清空正文、进行中开封请求失效、待确认交接邀请逾期，结算、审计
+  与通知同事务落库），再沿用 409 拒绝改期或取消，不得覆盖已到期清除；旧
+  计划未到而新提交时刻取锁后已非未来的，沿用 400 拒绝且不改变原计划（前部
+  结算仍落库，错误延迟到提交后返回）；截止前取得写锁的仍按现有规则处理；
 - 所有“检查 + 写入”都在 BEGIN IMMEDIATE 短事务内完成，并发同意/撤销/定时开封/
   到期/替换见证人/交接确认/到期清除只有一个已提交结果；
 - 当前封存人或当前指定见证人可在到点开封、清除等结算完成后签发**审计快照**：
@@ -3043,15 +3050,22 @@ def schedule_purge(
         raise err(403, "只有封存人可以安排到期清除")
 
     purge_at = utc_str(payload.purge_at)
-    now = utc_str(now_utc())
-    if purge_at <= now:
+    # 锁外快速预检；权威判定在写事务内以取得写锁后的实际时刻复核（见下）。
+    if purge_at <= utc_str(now_utc()):
         raise err(400, "清除时刻必须晚于当前时间")
 
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
     with authed_write_tx(db, user) as tx:
-        # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除。
-        # 清除时刻已到的资料在此生效（purged），随后的改期请求随即被拒。
+        # 时间判定一律以取得 BEGIN IMMEDIATE 写锁后的实际时刻为准：改期请求
+        # 可能在旧清除时刻（以及新提交的 purge_at）之前到达、等待写锁期间
+        # 越过任一时刻。绝不能用锁外到达时刻做判定，否则旧计划到期后仍被
+        # 改期、正文继续留存（本轮时间竞态）。
+        now = utc_str(now_utc())
+        # 临界区第一步与其他写路径一致：以锁内 now 先确定性到点开封与到期
+        # 清除（同刻清除优先；未开封资料的进行中开封请求失效、旧同意删除、
+        # 待确认交接邀请逾期；结算、审计与通知同事务落库）。清除时刻已到的
+        # 资料在此生效（purged），随后的改期请求随即被拒。
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
 
@@ -3061,8 +3075,13 @@ def schedule_purge(
         require_doc_role(tx, doc, user, owner_only=True,
                          owner_message="只有封存人可以安排到期清除")
         if doc["status"] == "purged":
-            # 清除可能刚在本临界区生效：必须先提交，错误延迟到提交后抛出
+            # 旧清除计划已到（清除可能刚在本临界区生效）：到期清除不得被
+            # 改期覆盖；必须先提交，错误延迟到提交后抛出。
             post_commit_error = err(409, "资料已清除，不能再安排或改期清除")
+        elif purge_at <= now:
+            # 新提交的时刻在取得写锁后已非未来：沿用既有 400 拒绝且不改变
+            # 原计划；前面的到点结算仍随本事务提交落库，故同样延迟到提交后。
+            post_commit_error = err(400, "清除时刻必须晚于当前时间")
         else:
             previous = doc["purge_at"]
             tx.execute(
@@ -3108,12 +3127,17 @@ def cancel_purge(
     if doc["owner_id"] != user["id"]:
         raise err(403, "只有封存人可以取消到期清除")
 
-    now = utc_str(now_utc())
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
     with authed_write_tx(db, user) as tx:
-        # 与改期相同：先确定性到点开封与到期清除；清除时刻已到的资料在此
-        # 生效，取消请求随即被拒（已到期不能取消）。
+        # 时间判定一律以取得 BEGIN IMMEDIATE 写锁后的实际时刻为准：取消请求
+        # 可能在旧清除时刻之前到达、等待写锁期间越过该时刻。绝不能用锁外
+        # 到达时刻做判定，否则到期清除被取消、正文继续留存（本轮时间竞态）。
+        now = utc_str(now_utc())
+        # 与改期相同：以锁内 now 先确定性到点开封与到期清除（同刻清除优先；
+        # 进行中开封请求失效、旧同意删除、待确认交接邀请逾期；结算、审计与
+        # 通知同事务落库）；清除时刻已到的资料在此生效，取消请求随即被拒
+        # （已到期不能取消）。
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
 
@@ -3122,9 +3146,13 @@ def cancel_purge(
         require_doc_role(tx, doc, user, owner_only=True,
                          owner_message="只有封存人可以取消到期清除")
         if doc["status"] == "purged":
+            # 旧清除计划已到（清除可能刚在本临界区生效）：到期清除不得被
+            # 取消覆盖；清除先提交，错误延迟到提交后返回。
             post_commit_error = err(409, "资料已清除，不能取消清除")
         elif doc["purge_at"] is None:
-            raise err(409, "当前没有已安排的清除时刻")
+            # 无清除安排的 409 本身不写任何数据，但本临界区前部的到点结算
+            # 仍须落库，故延迟到提交后抛出，不能让回滚连带撤销结算。
+            post_commit_error = err(409, "当前没有已安排的清除时刻")
         else:
             previous = doc["purge_at"]
             tx.execute(
