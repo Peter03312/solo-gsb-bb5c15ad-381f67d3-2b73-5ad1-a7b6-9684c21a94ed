@@ -12,11 +12,16 @@
 - 清除与最早开封同刻时清除优先；开封更早则先开封再清除；
 - 并发交接确认、见证同意与清除只产生一个一致结果；
 - 已清除资料不能再开封、替换见证人、交接或再安排清除；
-- 无权、无效时刻、已到期的改期或取消一律拒绝且不泄露正文。
+- 无权、无效时刻、已到期的改期或取消一律拒绝且不泄露正文；
+- 改期/取消的时刻判定以取得写锁后的实际时刻为准：等待写锁期间旧清除
+  时刻已到的，先结算清除（正文清空、请求/邀请失效、审计与通知落库），
+  再以 409 拒绝；新时刻在取锁后已非未来的按 400 拒绝且不改变原计划。
 """
+import contextlib
 import datetime as dt
 import os
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -470,6 +475,234 @@ def test_due_purge_commits_with_rejected_write(passive_client):
     row = conn.execute("SELECT status, body FROM documents WHERE id=?", (doc_id,)).fetchone()
     assert row[0] == "purged" and row[1] == ""
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 时间竞态：改期/取消在等待写锁期间越过旧清除时刻（时刻判定以取锁后为准）
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def held_purge_write_lock():
+    """在测试进程内占用同一数据库文件的写锁，模拟“请求已到达、等待写锁”窗口。
+
+    占用期间发起的改期/取消请求阻塞在 BEGIN IMMEDIATE；释放写锁后，被阻塞的
+    请求必须以“取得写锁后的实际时刻”判定旧清除计划与新提交时刻，而不是用
+    请求到达（锁外）时刻。
+    """
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"], timeout=30.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def _raw_purge_db():
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"])
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def test_reschedule_waiting_past_purge_time_purges_first(passive_client):
+    """改期在旧清除时刻前发出、取得写锁时旧时刻已到：先按既有顺序结算清除
+    （正文清空、进行中请求与待确认邀请失效、审计与通知落库），再以 409 拒绝，
+    不得用锁外时刻把已到期清除改期覆盖掉。"""
+    client = passive_client
+    keys, doc_id, dg = _setup(client)
+    # 进行中的开封请求（1 票）与待确认交接邀请：清除结算时应一并失效
+    req = _create_request(client, keys["owner"], doc_id)["request_id"]
+    _approve(client, keys["w1"], req, dg)
+    inv_id = client.post(
+        f"/documents/{doc_id}/handover-invitations",
+        json={"to_username": "new", "confirm_deadline": _in_hours(1)},
+        headers=auth(keys["owner"]),
+    ).json()["invitation_id"]
+    purge_at = _put_purge(client, keys["owner"], doc_id, _in_seconds(1.2)).json()["purge_at"]
+
+    outcome = {}
+
+    def late_reschedule():
+        r = _put_purge(client, keys["owner"], doc_id, _in_hours(1))
+        outcome["status"] = r.status_code
+        outcome["detail"] = r.json().get("detail")
+        outcome["body"] = r.text
+
+    with held_purge_write_lock():
+        t = threading.Thread(target=late_reschedule)
+        t.start()
+        time.sleep(1.6)  # 改期等待写锁期间越过 1.2s 的旧清除时刻
+    t.join(10)
+
+    # 既有 409，且响应不含正文
+    assert outcome["status"] == 409
+    assert outcome["detail"] == "资料已清除，不能再安排或改期清除"
+    assert BODY not in outcome["body"]
+
+    conn = _raw_purge_db()
+    try:
+        row = conn.execute(
+            "SELECT status, body, purge_at, purged_at FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()
+        # 清除已落库：正文清空，清除时刻保持原计划（未被改期覆盖）
+        assert row["status"] == "purged" and row["body"] == ""
+        assert row["purge_at"] == purge_at and row["purged_at"] == purge_at
+        # 进行中开封请求失效、旧同意删除、待确认交接邀请失效
+        assert conn.execute(
+            "SELECT status FROM open_requests WHERE id=?", (req,)
+        ).fetchone()[0] == "invalidated"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM approvals WHERE request_id=?", (req,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT status FROM handover_invitations WHERE id=?", (inv_id,)
+        ).fetchone()[0] == "expired"
+        # 结算、审计落库：清除恰好一次，无改期记录
+        actions = [
+            r["action"]
+            for r in conn.execute(
+                "SELECT action FROM audit_log WHERE document_id=? ORDER BY id", (doc_id,)
+            ).fetchall()
+        ]
+        assert actions.count("purged") == 1
+        assert "request_invalidated" in actions
+        assert "handover_invitation_expired" in actions
+        assert "purge_rescheduled" not in actions
+        # 通知落库：当时封存人 + 三名见证人各一条 purged 通知
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE document_id=? AND event_type='purged'",
+            (doc_id,),
+        ).fetchone()[0] == 4
+    finally:
+        conn.close()
+
+    # 任何接口不再返回正文
+    got = _get(client, keys["owner"], doc_id)
+    assert got.status_code == 200 and BODY not in got.text
+    assert got.json()["status"] == "purged"
+
+
+def test_cancel_waiting_past_purge_time_purges_first(passive_client):
+    """取消在清除时刻前发出、取得写锁时清除时刻已到：先结算清除落库，
+    再以既有 409 拒绝，不得把已到期清除取消掉。"""
+    client = passive_client
+    keys, doc_id, _ = _setup(client)
+    purge_at = _put_purge(client, keys["owner"], doc_id, _in_seconds(1.2)).json()["purge_at"]
+
+    outcome = {}
+
+    def late_cancel():
+        r = _del_purge(client, keys["owner"], doc_id)
+        outcome["status"] = r.status_code
+        outcome["detail"] = r.json().get("detail")
+        outcome["body"] = r.text
+
+    with held_purge_write_lock():
+        t = threading.Thread(target=late_cancel)
+        t.start()
+        time.sleep(1.6)  # 取消等待写锁期间越过 1.2s 的清除时刻
+    t.join(10)
+
+    assert outcome["status"] == 409
+    assert outcome["detail"] == "资料已清除，不能取消清除"
+    assert BODY not in outcome["body"]
+
+    conn = _raw_purge_db()
+    try:
+        row = conn.execute(
+            "SELECT status, body, purge_at, purged_at FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()
+        # 清除已落库且未被取消：正文清空，清除时刻保留
+        assert row["status"] == "purged" and row["body"] == ""
+        assert row["purge_at"] == purge_at and row["purged_at"] == purge_at
+        actions = [
+            r["action"]
+            for r in conn.execute(
+                "SELECT action FROM audit_log WHERE document_id=? ORDER BY id", (doc_id,)
+            ).fetchall()
+        ]
+        assert actions.count("purged") == 1
+        assert "purge_canceled" not in actions
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE document_id=? AND event_type='purged'",
+            (doc_id,),
+        ).fetchone()[0] == 4
+    finally:
+        conn.close()
+
+
+def test_reschedule_new_time_not_future_at_lock_keeps_original(passive_client):
+    """旧清除计划未到，但新提交的清除时刻在取得写锁后已非未来：
+    按既有 400 拒绝且不改变原计划（无改期审计、原时刻保留、资料未清除）。"""
+    client = passive_client
+    keys, doc_id, _ = _setup(client)
+    original = _put_purge(client, keys["owner"], doc_id, _in_hours(1)).json()["purge_at"]
+
+    outcome = {}
+
+    def late_reschedule():
+        # 提交时新时刻在未来（1.2s 后），等待写锁期间越过该时刻
+        r = _put_purge(client, keys["owner"], doc_id, _in_seconds(1.2))
+        outcome["status"] = r.status_code
+        outcome["detail"] = r.json().get("detail")
+        outcome["body"] = r.text
+
+    with held_purge_write_lock():
+        t = threading.Thread(target=late_reschedule)
+        t.start()
+        time.sleep(1.6)  # 改期等待写锁期间越过新提交的 1.2s 时刻
+    t.join(10)
+
+    assert outcome["status"] == 400
+    assert outcome["detail"] == "清除时刻必须晚于当前时间"
+    assert BODY not in outcome["body"]
+
+    conn = _raw_purge_db()
+    try:
+        row = conn.execute(
+            "SELECT status, body, purge_at, purged_at FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()
+        # 原计划不变：仍密封、正文在库、清除时刻仍为原安排
+        assert row["status"] == "sealed" and row["body"] == BODY
+        assert row["purge_at"] == original and row["purged_at"] is None
+        actions = [
+            r["action"]
+            for r in conn.execute(
+                "SELECT action FROM audit_log WHERE document_id=? ORDER BY id", (doc_id,)
+            ).fetchall()
+        ]
+        assert "purge_rescheduled" not in actions and "purged" not in actions
+    finally:
+        conn.close()
+
+    # 原计划仍然有效：到期前可正常取消
+    assert _del_purge(client, keys["owner"], doc_id).status_code == 200
+
+
+def test_cancel_waiting_past_new_time_unaffected(passive_client):
+    """对照：取消在清除时刻前取得写锁，仍按现有规则成功取消。"""
+    client = passive_client
+    keys, doc_id, _ = _setup(client)
+    _put_purge(client, keys["owner"], doc_id, _in_seconds(2.5))
+
+    outcome = {}
+
+    def quick_cancel():
+        r = _del_purge(client, keys["owner"], doc_id)
+        outcome["status"] = r.status_code
+
+    with held_purge_write_lock():
+        t = threading.Thread(target=quick_cancel)
+        t.start()
+        time.sleep(0.6)  # 取锁时清除时刻（2.5s 后）仍未到
+    t.join(10)
+
+    assert outcome["status"] == 200
+    got = _get(client, keys["owner"], doc_id).json()
+    assert got["status"] == "sealed" and got["purge_at"] is None
+    actions = [r["action"] for r in _audit(client, keys["owner"], doc_id)]
+    assert "purge_canceled" in actions and "purged" not in actions
 
 
 # ---------------------------------------------------------------------------

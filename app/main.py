@@ -3027,6 +3027,12 @@ def get_handover_invitation(
 # 或取消（DELETE）。交接后清除安排保留，改由新封存人管理（原封存人 403）。
 # 到点判定与开封/交接共用同一把写锁：清除若在本临界区内生效，清除先落库，
 # 改期/取消的拒绝在提交后再返回；已到期的改期或取消一律 409，且不泄露正文。
+# 时刻判定一律以取得 BEGIN IMMEDIATE 写锁后的实际时刻为准：改期/取消可能
+# 在旧清除时刻前到达、却在等待写锁期间越过旧清除时刻——取锁后先按既有顺序
+# 结算到点开封与到期清除（同刻清除优先），已到期清除随之落库（正文清空、
+# 进行中开封请求与待确认交接邀请失效、审计与通知同事务提交），随后改期/取消
+# 以既有 409 拒绝，不得用锁外时刻把已到期清除覆盖掉；新提交的清除时刻也以
+# 取锁后的实际时刻复核，取锁时已非未来的按既有 400 拒绝且不改变原计划。
 # ---------------------------------------------------------------------------
 
 
@@ -3043,15 +3049,19 @@ def schedule_purge(
         raise err(403, "只有封存人可以安排到期清除")
 
     purge_at = utc_str(payload.purge_at)
-    now = utc_str(now_utc())
-    if purge_at <= now:
+    # 锁外快速预检；权威判定在写事务内以取得写锁后的实际时刻复核（见下）。
+    if purge_at <= utc_str(now_utc()):
         raise err(400, "清除时刻必须晚于当前时间")
 
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
     with authed_write_tx(db, user) as tx:
-        # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除。
-        # 清除时刻已到的资料在此生效（purged），随后的改期请求随即被拒。
+        # 时刻判定以取得写锁后的实际时刻为准：改期请求可能在旧清除时刻前
+        # 到达、但等待 BEGIN IMMEDIATE 写锁期间旧清除时刻已到——必须以取锁
+        # 后的 now 先按既有顺序确定性结算到点开封与到期清除（同刻清除优先，
+        # 正文清空、进行中请求与待确认邀请失效、审计与通知一并落库），绝不
+        # 能用锁外时刻把已到期的清除改期覆盖掉。
+        now = utc_str(now_utc())
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
 
@@ -3063,6 +3073,10 @@ def schedule_purge(
         if doc["status"] == "purged":
             # 清除可能刚在本临界区生效：必须先提交，错误延迟到提交后抛出
             post_commit_error = err(409, "资料已清除，不能再安排或改期清除")
+        elif purge_at <= now:
+            # 旧计划未到（未清除），但新提交的清除时刻在等待写锁期间已非
+            # 未来：沿用既有 400 并整体回滚，不改变已安排的原清除时刻。
+            raise err(400, "清除时刻必须晚于当前时间")
         else:
             previous = doc["purge_at"]
             tx.execute(
@@ -3108,12 +3122,15 @@ def cancel_purge(
     if doc["owner_id"] != user["id"]:
         raise err(403, "只有封存人可以取消到期清除")
 
-    now = utc_str(now_utc())
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
     with authed_write_tx(db, user) as tx:
-        # 与改期相同：先确定性到点开封与到期清除；清除时刻已到的资料在此
-        # 生效，取消请求随即被拒（已到期不能取消）。
+        # 时刻判定以取得写锁后的实际时刻为准：取消请求可能在清除时刻前
+        # 到达、但等待 BEGIN IMMEDIATE 写锁期间清除时刻已到——必须以取锁
+        # 后的 now 先按既有顺序确定性结算到点开封与到期清除（同刻清除优先，
+        # 正文清空、进行中请求与待确认邀请失效、审计与通知一并落库），
+        # 绝不能用锁外时刻把已到期的清除取消掉。
+        now = utc_str(now_utc())
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
 
